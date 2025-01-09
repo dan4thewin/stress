@@ -79,7 +79,7 @@ void worker_init(void);
 /* Prototypes for worker functions.  */
 int hogcpu (void);
 int hogio (void);
-int hogvm (long long bytes, long long stride, long long hang, int keep);
+int hogvm (long long bytes, long long cold_bytes, long long stride, long long hang, int grow);
 int hoghdd (long long bytes);
 
 int
@@ -96,9 +96,10 @@ main (int argc, char **argv)
     long long do_io = 0;
     long long do_vm = 0;
     long long do_vm_bytes = 256 * 1024 * 1024;
+    long long do_vm_cold_bytes = 0;
     long long do_vm_stride = 4096;
     long long do_vm_hang = -1;
-    int do_vm_keep = 0;
+    int do_vm_grow = 0;
     long long do_hdd = 0;
     long long do_hdd_bytes = 1024 * 1024 * 1024;
 
@@ -202,6 +203,16 @@ main (int argc, char **argv)
                 exit (1);
             }
         }
+        else if (strcmp (arg, "--vm-cold-bytes") == 0)
+        {
+            assert_arg ("--vm-cold-bytes");
+            do_vm_cold_bytes = atoll_b (arg);
+            if (do_vm_cold_bytes <= 0)
+            {
+                err (stderr, "invalid vm cold byte value: %lli\n", do_vm_cold_bytes);
+                exit (1);
+            }
+        }
         else if (strcmp (arg, "--vm-stride") == 0)
         {
             assert_arg ("--vm-stride");
@@ -224,7 +235,11 @@ main (int argc, char **argv)
         }
         else if (strcmp (arg, "--vm-keep") == 0)
         {
-            do_vm_keep = 1;
+            do_vm_grow = -1;
+        }
+        else if (strcmp (arg, "--vm-grow") == 0)
+        {
+            do_vm_grow = 1;
         }
         else if (strcmp (arg, "--hdd") == 0 || strcmp (arg, "-d") == 0)
         {
@@ -350,7 +365,7 @@ main (int argc, char **argv)
                 usleep (backoff);
                 if (do_dryrun)
                     exit (0);
-                exit (hogvm (do_vm_bytes, do_vm_stride, do_vm_hang, do_vm_keep));
+                exit (hogvm (do_vm_bytes, do_vm_cold_bytes, do_vm_stride, do_vm_hang, do_vm_grow));
             case -1:           /* error */
                 err (stderr, "fork failed: %s\n", strerror (errno));
                 break;
@@ -494,31 +509,55 @@ hogio ()
     return 0;
 }
 
+/* grow==-1: malloc once and keep; grow==0: malloc and free each loop; grow==1: malloc without free */
 int
-hogvm (long long bytes, long long stride, long long hang, int keep)
+hogvm (long long bytes, long long cold_bytes, long long stride, long long hang, int grow)
 {
     long long i;
-    char *ptr = 0;
-    char c;
+    char *cold_ptr = 0;
     int do_malloc = 1;
+    struct chunk { struct chunk* next; char *buf; };
+    struct chunk *head = NULL, *last = NULL;
 
     while (1)
     {
-        if (do_malloc)
+        if (cold_bytes)
         {
-            dbg (stdout, "allocating %lli bytes ...\n", bytes);
-            if (!(ptr = (char *) malloc (bytes * sizeof (char))))
+            dbg (stdout, "allocating %lli cold bytes ...\n", cold_bytes);
+            if (!(cold_ptr = malloc (cold_bytes * sizeof (char))))
             {
                 err (stderr, "hogvm malloc failed: %s\n", strerror (errno));
                 return 1;
             }
-            if (keep)
+            dbg (stdout, "touching bytes in strides of %lli bytes ...\n", stride);
+            for (i = 0; i < cold_bytes; i += stride)
+                cold_ptr[i] = 'Z';           /* Ensure that COW happens.  */
+            cold_bytes = 0;
+        }
+
+        if (do_malloc)
+        {
+            struct chunk *tmp;
+            dbg (stdout, "allocating %lli bytes ...\n", bytes);
+            if (!(tmp = malloc (sizeof(struct chunk) + (bytes * sizeof(char)))))
+            {
+                err (stderr, "hogvm malloc failed: %s\n", strerror (errno));
+                return 1;
+            }
+            tmp->next = NULL;
+            tmp->buf = (char *) tmp + sizeof(struct chunk);
+            if (!head)
+                head = last = tmp;
+            else
+                last = last->next = tmp;
+            if (grow == -1)
                 do_malloc = 0;
         }
 
         dbg (stdout, "touching bytes in strides of %lli bytes ...\n", stride);
-        for (i = 0; i < bytes; i += stride)
-            ptr[i] = 'Z';           /* Ensure that COW happens.  */
+        for (struct chunk *tmp = head; tmp; tmp = tmp->next)
+            for (char *p = tmp->buf; p < (tmp->buf + bytes); p += stride)
+                *p = 'Z';           /* Ensure that COW happens.  */
 
         if (hang == 0)
         {
@@ -532,19 +571,18 @@ hogvm (long long bytes, long long stride, long long hang, int keep)
             sleep (hang);
         }
 
-        for (i = 0; i < bytes; i += stride)
-        {
-            c = ptr[i];
-            if (c != 'Z')
-            {
-                err (stderr, "memory corruption at: %p\n", ptr + i);
-                return 1;
-            }
-        }
+        for (struct chunk *tmp = head; tmp; tmp = tmp->next)
+            for (char *p = tmp->buf; p < (tmp->buf + bytes); p += stride)
+                if (*p != 'Z')
+                {
+                    err (stderr, "memory corruption at: %p\n", p);
+                    return 1;
+                }
 
-        if (do_malloc)
+        if (grow == 0)
         {
-            free (ptr);
+            free (head);
+            head = NULL;
             dbg (stdout, "freed %lli bytes\n", bytes);
         }
     }
@@ -766,9 +804,11 @@ usage (int status)
         " -i, --io N         spawn N workers spinning on sync()\n"
         " -m, --vm N         spawn N workers spinning on malloc()/free()\n"
         "     --vm-bytes B   malloc B bytes per vm worker (default is 256MB)\n"
+        "     --vm-cold-bytes B   malloc B bytes per vm worker (default is 0)\n"
         "     --vm-stride B  touch a byte every B bytes (default is 4096)\n"
-        "     --vm-hang N    sleep N secs before free (default none, 0 is inf)\n"
+        "     --vm-hang N    sleep N secs before next iteration (default none, 0 is inf)\n"
         "     --vm-keep      redirty memory instead of freeing and reallocating\n"
+        "     --vm-grow      repeat malloc each iteration, implies --vm-keep\n"
         " -d, --hdd N        spawn N workers spinning on write()/unlink()\n"
         "     --hdd-bytes B  write B bytes per hdd worker (default is 1GB)\n\n"
         "Example: %s --cpu 8 --io 4 --vm 2 --vm-bytes 128M --timeout 10s\n\n"
